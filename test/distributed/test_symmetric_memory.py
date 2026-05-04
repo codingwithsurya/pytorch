@@ -1375,6 +1375,12 @@ class LoweringTest(MultiProcContinuousTest):
         self.assertEqual(
             len(p2p_matches), 2, f"Expected 2 p2p allocations, got {len(p2p_matches)}"
         )
+        alloc_id_matches = re.findall(
+            r"alloc_id=_inductor_comm_buffer_alloc_id_offset \+ (\d+)",
+            code_no_reuse,
+        )
+        self.assertEqual(alloc_id_matches, ["0", "1"])
+        self.assertNotIn("random.randint", code_no_reuse)
 
         # Check numerical result for no_reuse path
         eager_no_reuse = func_no_reuse_eager(x, w1, w2)
@@ -1418,6 +1424,12 @@ class LoweringTest(MultiProcContinuousTest):
             1,
             f"Expected 1 p2p allocation (reuse), got {len(p2p_matches_reuse)}",
         )
+        alloc_id_matches_reuse = re.findall(
+            r"alloc_id=_inductor_comm_buffer_alloc_id_offset \+ (\d+)",
+            code_reuse,
+        )
+        self.assertEqual(alloc_id_matches_reuse, ["0"])
+        self.assertNotIn("random.randint", code_reuse)
 
         cuda_matches = re.findall(r"buf\d+ = empty_strided_cuda", code_reuse)
         self.assertGreaterEqual(

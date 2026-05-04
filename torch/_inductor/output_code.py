@@ -26,6 +26,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import threading
 from functools import partial
 from typing import Any, cast, TYPE_CHECKING, TypeAlias
 
@@ -74,6 +75,22 @@ if TYPE_CHECKING:
     from .triton_bundler import TritonBundle
 
 log = logging.getLogger(__name__)
+
+
+_comm_buffer_alloc_id_lock = threading.Lock()
+_next_comm_buffer_alloc_id = 0
+
+
+def _reserve_comm_buffer_alloc_ids(count: int) -> int:
+    assert count >= 0
+    if count == 0:
+        return 0
+
+    global _next_comm_buffer_alloc_id
+    with _comm_buffer_alloc_id_lock:
+        start = _next_comm_buffer_alloc_id
+        _next_comm_buffer_alloc_id += count
+    return start
 
 
 @dataclasses.dataclass
@@ -488,6 +505,7 @@ class CompiledFxGraph(OutputCode):
     disabled_cudagraphs_reason: str | None
     metrics_deltas: metrics.CachedMetricsDeltas
     counter_deltas: Counter[str]
+    comm_buffer_alloc_id_count: int
     # This is a string representation of an expression we serialize
     # with the object so the guards can be evaluated in a different
     # context in order to verify the validity of serving a cached
@@ -509,6 +527,9 @@ class CompiledFxGraph(OutputCode):
     _wrap_compiled_regions: bool = False
     _defers_input_alignment: bool = False
     _compile_context: CompileContext | None = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _comm_buffer_alloc_id_offset: int | None = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
     # Metadata-stripped copy of the FX graph for fake tensor propagation.
@@ -585,6 +606,9 @@ class CompiledFxGraph(OutputCode):
         self.disabled_cudagraphs_reason = disabled_cudagraphs_reason
         self.metrics_deltas = metrics_deltas
         self.counter_deltas = counter_deltas
+        self.comm_buffer_alloc_id_count = getattr(
+            graph.wrapper_code, "comm_buffer_alloc_id_count", 0
+        )
         self.guards_expr = None
         self.extern_libs_key = None
         self.cudagraph_info = None
@@ -680,6 +704,7 @@ class CompiledFxGraph(OutputCode):
         # Store whether to wrap compiled regions in inductor_compiled_code HOP
         # This is set at compile time to avoid runtime overhead
         self._wrap_compiled_regions = config.wrap_inductor_compiled_regions
+        self._comm_buffer_alloc_id_offset = None
 
         if self._wrap_compiled_regions:
             # Store a metadata-stripped copy of the FX graph. Running this
@@ -710,6 +735,31 @@ class CompiledFxGraph(OutputCode):
             )
             else None
         )
+
+    def _assign_comm_buffer_alloc_id_offset(self) -> None:
+        count = getattr(self, "comm_buffer_alloc_id_count", 0)
+        if count == 0:
+            return
+
+        if getattr(self, "_comm_buffer_alloc_id_offset", None) is None:
+            self._comm_buffer_alloc_id_offset = _reserve_comm_buffer_alloc_ids(count)
+
+        # Python wrapper modules read this global at runtime when calling
+        # empty_strided_p2p(..., alloc_id=...).  It is assigned after both fresh
+        # compiles and cache loads so identical cached artifacts reserve
+        # non-overlapping process-wide id ranges.
+        if self.current_callable is not None:
+            globals_ = getattr(self.current_callable, "__globals__", None)
+            if globals_ is None:
+                globals_ = getattr(
+                    getattr(self.current_callable, "__func__", None),
+                    "__globals__",
+                    None,
+                )
+            if globals_ is not None:
+                globals_["_inductor_comm_buffer_alloc_id_offset"] = (
+                    self._comm_buffer_alloc_id_offset
+                )
 
     def __call__(self, inputs: Sequence[Any]) -> Any:
         assert self.current_callable is not None
@@ -782,6 +832,8 @@ class CompiledFxGraph(OutputCode):
         This runs whether or not we have a cache hit, and always runs directly after we get a CompiledFxGraph.
         The results of this function are *not* saved in the cache itself.
         """
+        self._assign_comm_buffer_alloc_id_offset()
+
         if config.graph_partition and _unstable_customized_partition_wrapper.wrapper:
             # Mechanically apply user-specified cudagraph wrappers without modification
             assert self.recursively_apply_fns is not None
@@ -926,6 +978,7 @@ class CompiledFxGraph(OutputCode):
         self.current_callable = None
         self.recursively_apply_fns = None
         self.compiled_fn_runner = None
+        self._comm_buffer_alloc_id_offset = None
         if self._original_gm is not None:
             from torch.fx._graph_pickler import GraphPickler, Options
 

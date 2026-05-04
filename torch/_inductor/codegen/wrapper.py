@@ -10,7 +10,6 @@ import inspect
 import logging
 import operator
 import os
-import random
 import re
 import tempfile
 from collections.abc import Callable
@@ -979,6 +978,7 @@ class AllocateLine(MemoryPlanningLine):
         group_name = layout.group_name
 
         if comm_buffer_type == ir.CommBufferType.SYMM_MEM:
+            alloc_id = self.wrapper.next_comm_buffer_alloc_id()
             line = (
                 f"{name} = empty_strided_p2p("
                 f"{self.wrapper.codegen_shape_tuple(shape)}, "
@@ -986,7 +986,7 @@ class AllocateLine(MemoryPlanningLine):
                 f"{dtype}, "
                 f'torch.device("cuda:{device.index}"), '
                 f'group_name="{group_name}", '
-                f"alloc_id={random.randint(0, 2**64 - 1)})"
+                f"alloc_id=_inductor_comm_buffer_alloc_id_offset + {alloc_id})"
             )
         else:
             raise NotImplementedError(
@@ -1271,6 +1271,7 @@ class PythonWrapperCodegen(CodeGen):
         # pre-existing kernel for it
         self.src_to_kernel: dict[str, str] = {}
         self.kernel_numel_expr: OrderedSet[tuple[str, GraphLowering]] = OrderedSet()
+        self.comm_buffer_alloc_id_count = 0
         self.lines: list[Line] = []
         self.declare = ""
         self.declare_maybe_reference = ""
@@ -1363,6 +1364,15 @@ class PythonWrapperCodegen(CodeGen):
         # pyrefly: ignore [bad-assignment]
         self.launcher_fn_name = "call"
 
+    def get_root_graph(self) -> PythonWrapperCodegen:
+        return self
+
+    def next_comm_buffer_alloc_id(self) -> int:
+        root = self.get_root_graph()
+        alloc_id = root.comm_buffer_alloc_id_count
+        root.comm_buffer_alloc_id_count += 1
+        return alloc_id
+
     def write_constant(self, name: str, hashed: str) -> None:
         self.header.writeline(f"{name} = None  # {hashed}")
 
@@ -1384,7 +1394,6 @@ class PythonWrapperCodegen(CodeGen):
                 from ctypes import c_void_p, c_long, c_int
                 import torch
                 import math
-                import random
                 import os
                 import tempfile
                 from math import inf, nan
@@ -1425,6 +1434,7 @@ class PythonWrapperCodegen(CodeGen):
             self.header.splice(
                 """
                 empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+                _inductor_comm_buffer_alloc_id_offset = 0
                 """,
                 strip=True,
             )

@@ -112,6 +112,7 @@ torch._dynamo.config.fake_tensor_cache_enabled = True
 torch._dynamo.config.fake_tensor_cache_crosscheck_enabled = True
 
 
+_inductor_comm_buffer_alloc_id_offset = -1
 STATIC_LAUNCHER_DEVICES = ("cuda", "xpu")
 
 
@@ -3400,6 +3401,114 @@ class TestFxGraphCacheHashing(TestCase):
             finally:
                 temp.close()
                 os.unlink(temp.name)
+
+
+class TestCompiledFxGraphCommBufferAllocIds(TestCase):
+    # Each test starts with the process-wide counter at 0.
+    def setUp(self):
+        super().setUp()
+        self._reset_comm_buffer_alloc_id_counter()
+        self.addCleanup(self._reset_comm_buffer_alloc_id_counter)
+
+    def _reset_comm_buffer_alloc_id_counter(self):
+        import torch._inductor.output_code as output_code
+
+        with output_code._comm_buffer_alloc_id_lock:
+            output_code._next_comm_buffer_alloc_id = 0
+
+    # Fake CompiledFxGraph + callable whose __globals__ stand in for the
+    # generated wrapper module. -1 sentinel = "global not patched".
+    def _make_graph(self, count):
+        from torch._inductor.output_code import CompiledFxGraph
+
+        def current_callable(inputs):
+            return _inductor_comm_buffer_alloc_id_offset
+
+        fn = types.FunctionType(
+            current_callable.__code__,
+            {"_inductor_comm_buffer_alloc_id_offset": -1},
+        )
+        graph = CompiledFxGraph.__new__(CompiledFxGraph)
+        graph.current_callable = fn
+        graph.recursively_apply_fns = None
+        graph.compiled_fn_runner = None
+        graph.comm_buffer_alloc_id_count = count
+        graph._comm_buffer_alloc_id_offset = None
+        graph._original_gm = None
+        return graph, fn
+
+    # Distinct artifacts get disjoint id ranges; reassigning is idempotent.
+    def test_comm_buffer_alloc_id_ranges_are_reserved_per_artifact(self):
+        graph0, fn0 = self._make_graph(2)  # [0, 2)
+        graph0._assign_comm_buffer_alloc_id_offset()
+        self.assertEqual(graph0._comm_buffer_alloc_id_offset, 0)
+        self.assertEqual(fn0.__globals__["_inductor_comm_buffer_alloc_id_offset"], 0)
+
+        graph0._assign_comm_buffer_alloc_id_offset()  # idempotent
+        self.assertEqual(graph0._comm_buffer_alloc_id_offset, 0)
+
+        graph1, fn1 = self._make_graph(3)  # [2, 5)
+        graph1._assign_comm_buffer_alloc_id_offset()
+        self.assertEqual(graph1._comm_buffer_alloc_id_offset, 2)
+        self.assertEqual(fn1.__globals__["_inductor_comm_buffer_alloc_id_offset"], 2)
+
+        graph2, fn2 = self._make_graph(1)  # [5, 6)
+        graph2._assign_comm_buffer_alloc_id_offset()
+        self.assertEqual(graph2._comm_buffer_alloc_id_offset, 5)
+        self.assertEqual(fn2.__globals__["_inductor_comm_buffer_alloc_id_offset"], 5)
+
+    # count=0 short-circuits: no counter advance, no global patch.
+    def test_zero_comm_buffer_alloc_ids_do_not_reserve_range(self):
+        graph0, fn0 = self._make_graph(0)
+        graph0._assign_comm_buffer_alloc_id_offset()
+        self.assertIsNone(graph0._comm_buffer_alloc_id_offset)
+        self.assertEqual(fn0.__globals__["_inductor_comm_buffer_alloc_id_offset"], -1)
+
+        # Next graph still starts at 0 -> counter wasn't advanced above.
+        graph1, fn1 = self._make_graph(1)
+        graph1._assign_comm_buffer_alloc_id_offset()
+        self.assertEqual(graph1._comm_buffer_alloc_id_offset, 0)
+        self.assertEqual(fn1.__globals__["_inductor_comm_buffer_alloc_id_offset"], 0)
+
+    # Cache round-trip: count persists, offset does not, reload gets a fresh range.
+    def test_comm_buffer_alloc_id_offset_is_not_serialized(self):
+        graph, fn = self._make_graph(2)
+        graph._assign_comm_buffer_alloc_id_offset()
+        self.assertEqual(graph._comm_buffer_alloc_id_offset, 0)
+
+        graph.prepare_for_serialization()
+        self.assertIsNone(graph._comm_buffer_alloc_id_offset)
+        self.assertEqual(graph.comm_buffer_alloc_id_count, 2)
+
+        graph.current_callable = fn  # mimic after_deserialization rebinding
+        graph._assign_comm_buffer_alloc_id_offset()
+        self.assertEqual(graph._comm_buffer_alloc_id_offset, 2)
+        self.assertEqual(fn.__globals__["_inductor_comm_buffer_alloc_id_offset"], 2)
+
+    # current_callable as bound method -> globals reached via __func__.
+    def test_comm_buffer_alloc_id_offset_updates_bound_method_globals(self):
+        from torch._inductor.output_code import CompiledFxGraph
+
+        class Runner:
+            def call(self, inputs):
+                return _inductor_comm_buffer_alloc_id_offset
+
+        graph = CompiledFxGraph.__new__(CompiledFxGraph)
+        graph.current_callable = Runner().call
+        graph.recursively_apply_fns = None
+        graph.compiled_fn_runner = None
+        graph.comm_buffer_alloc_id_count = 1
+        graph._comm_buffer_alloc_id_offset = None
+        graph._original_gm = None
+
+        graph._assign_comm_buffer_alloc_id_offset()
+        self.assertEqual(graph._comm_buffer_alloc_id_offset, 0)
+        self.assertEqual(
+            graph.current_callable.__func__.__globals__[
+                "_inductor_comm_buffer_alloc_id_offset"
+            ],
+            0,
+        )
 
 
 class TestCudaCompileCommand(TestCase):
